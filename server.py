@@ -7,6 +7,8 @@ the relay forwards traffic to user apps over persistent WebSocket tunnels.
 Routes:
   POST /register                              — App registers, gets a token
   POST /admin/tokens                          — Add tokens to whitelist (private mode only)
+  DELETE /admin/tokens                        — Remove tokens from whitelist (private mode only)
+  GET  /admin/stats                           — Per-token request stats (private mode only)
   WS   /tunnel/{token}                        — App opens WebSocket tunnel
   GET  /.well-known/oauth-authorization-server — OAuth 2.1 metadata
   GET  /.well-known/oauth-protected-resource   — Resource metadata
@@ -94,6 +96,42 @@ def _load_whitelist() -> None:
 
 
 _load_whitelist()
+
+# ---------------------------------------------------------------------------
+# Per-token stats and rate limiting
+# ---------------------------------------------------------------------------
+
+RATE_LIMIT_RPM = int(os.getenv("RATE_LIMIT_RPM", "30"))
+
+# token → {"requests": int, "last_seen": float}
+_token_stats: dict[str, dict] = {}
+
+# Token bucket rate limiter — O(1) memory per token regardless of request rate.
+# Each entry is [allowance: float, last_refill: float].
+# Refill rate: RATE_LIMIT_RPM tokens per 60s. Bucket capacity = RATE_LIMIT_RPM.
+_rate_buckets: dict[str, list[float]] = {}
+
+
+def _record_request(token: str) -> None:
+    now = time.time()
+    stats = _token_stats.setdefault(token, {"requests": 0, "last_seen": 0.0, "issued_at": now})
+    stats["requests"] += 1
+    stats["last_seen"] = now
+
+
+def _check_rate_limit(token: str) -> bool:
+    """Return True if the request is allowed, False if rate limit exceeded."""
+    now = time.time()
+    if token not in _rate_buckets:
+        _rate_buckets[token] = [float(RATE_LIMIT_RPM), now]
+    bucket = _rate_buckets[token]
+    elapsed = now - bucket[1]
+    bucket[1] = now
+    bucket[0] = min(RATE_LIMIT_RPM, bucket[0] + elapsed * (RATE_LIMIT_RPM / 60.0))
+    if bucket[0] < 1.0:
+        return False
+    bucket[0] -= 1.0
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -211,10 +249,12 @@ async def admin_add_tokens(request: Request) -> JSONResponse:
     if not isinstance(new_tokens, list):
         return JSONResponse({"error": "tokens must be a list"}, status_code=400)
     added = []
+    now = time.time()
     for t in new_tokens:
         t = str(t).strip()
         if t and t not in _valid_tokens:
             _valid_tokens.add(t)
+            _token_stats.setdefault(t, {"requests": 0, "last_seen": 0.0, "issued_at": now})
             added.append(t)
     if added and _TOKENS_FILE:
         os.makedirs(os.path.dirname(_TOKENS_FILE) or ".", exist_ok=True)
@@ -223,6 +263,66 @@ async def admin_add_tokens(request: Request) -> JSONResponse:
                 f.write(t + "\n")
     log.info(f"Admin: added {len(added)} tokens ({len(_valid_tokens)} total)")
     return JSONResponse({"added": len(added), "total": len(_valid_tokens)})
+
+
+async def admin_remove_tokens(request: Request) -> JSONResponse:
+    if _valid_tokens is None:
+        return JSONResponse({"error": "Not in private mode"}, status_code=404)
+    auth = request.headers.get("authorization", "")
+    if not _ADMIN_SECRET or auth != f"Bearer {_ADMIN_SECRET}":
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    body = await request.json()
+    remove = body.get("tokens", [])
+    if not isinstance(remove, list):
+        return JSONResponse({"error": "tokens must be a list"}, status_code=400)
+    removed = [t for t in (str(t).strip() for t in remove) if t and t in _valid_tokens]
+    for t in removed:
+        _valid_tokens.discard(t)
+        tunnels.pop(t, None)
+        _token_stats.pop(t, None)
+        _rate_buckets.pop(t, None)
+    if removed and _TOKENS_FILE:
+        try:
+            with open(_TOKENS_FILE) as f:
+                lines = f.readlines()
+            with open(_TOKENS_FILE, "w") as f:
+                for line in lines:
+                    if line.strip() not in removed:
+                        f.write(line)
+        except FileNotFoundError:
+            pass
+    log.info(f"Admin: removed {len(removed)} tokens ({len(_valid_tokens)} total)")
+    return JSONResponse({"removed": len(removed), "total": len(_valid_tokens)})
+
+
+async def admin_stats(request: Request) -> JSONResponse:
+    if _valid_tokens is None:
+        return JSONResponse({"error": "Not in private mode"}, status_code=404)
+    auth = request.headers.get("authorization", "")
+    if not _ADMIN_SECRET or auth != f"Bearer {_ADMIN_SECRET}":
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    now = time.time()
+    tokens = []
+    for token in _valid_tokens:
+        stats = _token_stats.get(token, {})
+        requests = stats.get("requests", 0)
+        issued_at = stats.get("issued_at") or now
+        days_active = max((now - issued_at) / 86400.0, 1 / 1440.0)  # minimum 1 minute
+        requests_per_day = round(requests / days_active, 2)
+        tokens.append({
+            "token": token,
+            "connected": token in tunnels and tunnels[token].ws is not None,
+            "requests": requests,
+            "requests_per_day": requests_per_day,
+            "last_seen": stats.get("last_seen") or None,
+            "issued_at": issued_at,
+        })
+    tokens.sort(key=lambda t: t["requests_per_day"], reverse=True)
+    return JSONResponse({
+        "total_tokens": len(_valid_tokens),
+        "active_tunnels": sum(1 for t in tunnels.values() if t.ws is not None),
+        "tokens": tokens,
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -695,6 +795,11 @@ async def proxy_request(request: Request) -> Response | JSONResponse:
     if not _check_bearer(request, token):
         return _unauthorized(request, token)
 
+    if not _check_rate_limit(token):
+        return JSONResponse({"error": "Rate limit exceeded."}, status_code=429)
+
+    _record_request(token)
+
     tunnel = tunnels.get(token)
     if not tunnel:
         return JSONResponse({"error": "Unknown brain. Check your relay URL."}, status_code=404)
@@ -755,6 +860,11 @@ async def proxy_sse(request: Request):
 
     if not _check_bearer(request, token):
         return _unauthorized(request, token)
+
+    if not _check_rate_limit(token):
+        return JSONResponse({"error": "Rate limit exceeded."}, status_code=429)
+
+    _record_request(token)
 
     tunnel = tunnels.get(token)
     if not tunnel:
@@ -836,6 +946,8 @@ routes = [
     Route("/health", health, methods=["GET"]),
     Route("/register", register, methods=["POST"]),
     Route("/admin/tokens", admin_add_tokens, methods=["POST"]),
+    Route("/admin/tokens", admin_remove_tokens, methods=["DELETE"]),
+    Route("/admin/stats", admin_stats, methods=["GET"]),
     # OAuth 2.1 discovery + flow (must come before /{token}/... catch-alls)
     Route("/.well-known/oauth-authorization-server", oauth_server_metadata, methods=["GET"]),
     # RFC 8414 path-based discovery: Codex appends the full MCP path (e.g. /{token}/mcp)
