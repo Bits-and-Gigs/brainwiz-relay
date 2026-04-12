@@ -985,7 +985,7 @@ routes = [
 app = Starlette(routes=routes)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["https://admin.brainwiz.app"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
