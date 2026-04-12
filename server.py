@@ -102,8 +102,10 @@ _load_whitelist()
 # ---------------------------------------------------------------------------
 
 RATE_LIMIT_RPM = int(os.getenv("RATE_LIMIT_RPM", "30"))
+MAX_BODY_BYTES = int(os.getenv("MAX_BODY_BYTES", str(1024 * 1024)))  # 1MB default
+STATS_TOP_N = int(os.getenv("STATS_TOP_N", "100"))
 
-# token → {"requests": int, "last_seen": float}
+# token → {"requests": int, "last_seen": float, "issued_at": float, "total_bytes": int}
 _token_stats: dict[str, dict] = {}
 
 # Token bucket rate limiter — O(1) memory per token regardless of request rate.
@@ -112,11 +114,12 @@ _token_stats: dict[str, dict] = {}
 _rate_buckets: dict[str, list[float]] = {}
 
 
-def _record_request(token: str) -> None:
+def _record_request(token: str, body_bytes: int = 0) -> None:
     now = time.time()
-    stats = _token_stats.setdefault(token, {"requests": 0, "last_seen": 0.0, "issued_at": now})
+    stats = _token_stats.setdefault(token, {"requests": 0, "last_seen": 0.0, "issued_at": now, "total_bytes": 0})
     stats["requests"] += 1
     stats["last_seen"] = now
+    stats["total_bytes"] += body_bytes
 
 
 def _check_rate_limit(token: str) -> bool:
@@ -254,7 +257,7 @@ async def admin_add_tokens(request: Request) -> JSONResponse:
         t = str(t).strip()
         if t and t not in _valid_tokens:
             _valid_tokens.add(t)
-            _token_stats.setdefault(t, {"requests": 0, "last_seen": 0.0, "issued_at": now})
+            _token_stats.setdefault(t, {"requests": 0, "last_seen": 0.0, "issued_at": now, "total_bytes": 0})
             added.append(t)
     if added and _TOKENS_FILE:
         os.makedirs(os.path.dirname(_TOKENS_FILE) or ".", exist_ok=True)
@@ -302,26 +305,27 @@ async def admin_stats(request: Request) -> JSONResponse:
     if not _ADMIN_SECRET or auth != f"Bearer {_ADMIN_SECRET}":
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
     now = time.time()
-    tokens = []
+    rows = []
     for token in _valid_tokens:
         stats = _token_stats.get(token, {})
         requests = stats.get("requests", 0)
+        total_bytes = stats.get("total_bytes", 0)
         issued_at = stats.get("issued_at") or now
-        days_active = max((now - issued_at) / 86400.0, 1 / 1440.0)  # minimum 1 minute
-        requests_per_day = round(requests / days_active, 2)
-        tokens.append({
+        days_active = max((now - issued_at) / 86400.0, 1 / 1440.0)
+        rows.append({
             "token": token,
             "connected": token in tunnels and tunnels[token].ws is not None,
             "requests": requests,
-            "requests_per_day": requests_per_day,
+            "requests_per_day": round(requests / days_active, 2),
+            "avg_bytes_per_request": round(total_bytes / requests, 1) if requests else 0,
             "last_seen": stats.get("last_seen") or None,
             "issued_at": issued_at,
         })
-    tokens.sort(key=lambda t: t["requests_per_day"], reverse=True)
     return JSONResponse({
         "total_tokens": len(_valid_tokens),
         "active_tunnels": sum(1 for t in tunnels.values() if t.ws is not None),
-        "tokens": tokens,
+        "top_by_requests_per_day": sorted(rows, key=lambda r: r["requests_per_day"], reverse=True)[:STATS_TOP_N],
+        "top_by_avg_bytes": sorted(rows, key=lambda r: r["avg_bytes_per_request"], reverse=True)[:STATS_TOP_N],
     })
 
 
@@ -798,7 +802,11 @@ async def proxy_request(request: Request) -> Response | JSONResponse:
     if not _check_rate_limit(token):
         return JSONResponse({"error": "Rate limit exceeded."}, status_code=429)
 
-    _record_request(token)
+    body_raw = await request.body()
+    if len(body_raw) > MAX_BODY_BYTES:
+        return JSONResponse({"error": "Payload too large."}, status_code=413)
+
+    _record_request(token, body_bytes=len(body_raw))
 
     tunnel = tunnels.get(token)
     if not tunnel:
@@ -814,7 +822,7 @@ async def proxy_request(request: Request) -> Response | JSONResponse:
     if sub_path.startswith(prefix):
         sub_path = sub_path[len(prefix):] or "/"
 
-    body = (await request.body()).decode("utf-8", errors="replace")
+    body = body_raw.decode("utf-8", errors="replace")
     req_id = str(uuid.uuid4())
 
     envelope = {
