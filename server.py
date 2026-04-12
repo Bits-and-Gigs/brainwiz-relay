@@ -41,6 +41,7 @@ from typing import Union
 from urllib.parse import parse_qs, urlparse
 
 from starlette.applications import Starlette
+from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from starlette.routing import Route, WebSocketRoute
@@ -982,6 +983,12 @@ routes = [
 ]
 
 app = Starlette(routes=routes)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 if __name__ == "__main__":
     import argparse
