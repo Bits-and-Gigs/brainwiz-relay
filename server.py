@@ -217,6 +217,7 @@ async def admin_add_tokens(request: Request) -> JSONResponse:
             _valid_tokens.add(t)
             added.append(t)
     if added and _TOKENS_FILE:
+        os.makedirs(os.path.dirname(_TOKENS_FILE) or ".", exist_ok=True)
         with open(_TOKENS_FILE, "a") as f:
             for t in added:
                 f.write(t + "\n")
