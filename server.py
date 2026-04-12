@@ -6,6 +6,7 @@ the relay forwards traffic to user apps over persistent WebSocket tunnels.
 
 Routes:
   POST /register                              — App registers, gets a token
+  POST /admin/tokens                          — Add tokens to whitelist (private mode only)
   WS   /tunnel/{token}                        — App opens WebSocket tunnel
   GET  /.well-known/oauth-authorization-server — OAuth 2.1 metadata
   GET  /.well-known/oauth-protected-resource   — Resource metadata
@@ -13,6 +14,12 @@ Routes:
   POST /authorize                             — Process approval, redirect with code
   POST /token                                 — Exchange code for bearer token
   *    /{token}/mcp[/...]                     — AI clients hit MCP via relay
+
+Modes:
+  Public (default): any well-formed token is accepted on /register.
+  Private: set TOKENS_FILE=/path/to/tokens.txt and ADMIN_SECRET=<secret>.
+           Only tokens listed in the file are accepted. New tokens can be
+           added at runtime via POST /admin/tokens without a restart.
 
 The relay is stateless (in-memory token→tunnel map). It holds no user data.
 Deploy on Fly.io or any platform that terminates TLS upstream.
@@ -23,6 +30,7 @@ import base64
 import hashlib
 import json
 import logging
+import os
 import secrets
 import time
 import uuid
@@ -32,7 +40,7 @@ from urllib.parse import parse_qs, urlparse
 
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, StreamingResponse
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 import uvicorn
@@ -59,6 +67,33 @@ tunnels: dict[str, Tunnel] = {}
 
 # Short-lived auth codes: code → {token, code_challenge, redirect_uri, state, expires_at}
 auth_codes: dict[str, dict] = {}
+
+# ---------------------------------------------------------------------------
+# Private mode — token whitelist
+# ---------------------------------------------------------------------------
+
+_TOKENS_FILE = os.getenv("TOKENS_FILE", "")
+_ADMIN_SECRET = os.getenv("ADMIN_SECRET", "")
+_valid_tokens: set[str] | None = None  # None = public mode
+
+
+def _load_whitelist() -> None:
+    global _valid_tokens
+    if not _TOKENS_FILE:
+        return  # public mode
+    _valid_tokens = set()
+    try:
+        with open(_TOKENS_FILE) as f:
+            for line in f:
+                t = line.strip()
+                if t:
+                    _valid_tokens.add(t)
+        log.info(f"Private mode: {len(_valid_tokens)} tokens loaded from {_TOKENS_FILE}")
+    except FileNotFoundError:
+        log.info(f"Private mode: {_TOKENS_FILE} not found, starting with empty whitelist")
+
+
+_load_whitelist()
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +165,20 @@ async def register(request: Request) -> JSONResponse:
     body = await request.json()
     token = body.get("token")
 
+    # Private mode: validate token against whitelist before doing anything else.
+    if _valid_tokens is not None:
+        if not token or token not in _valid_tokens:
+            return JSONResponse({"error": "Invalid or missing license key"}, status_code=403)
+        if token not in tunnels:
+            tunnels[token] = Tunnel(token=token)
+            log.info(f"New tunnel registered (private): {token[:8]}...")
+        else:
+            tunnels[token].last_seen = time.time()
+            log.info(f"Re-registered tunnel (private): {token[:8]}...")
+        base = _relay_base(request)
+        return JSONResponse({"token": token, "mcp_url": f"{base}/{token}/mcp"})
+
+    # Public mode: accept any well-formed token or generate a new one.
     if token and len(token) >= 16:
         # Accept any well-formed token, even after a relay restart.
         # Tokens have 192 bits of entropy — guessing one is not feasible.
@@ -149,6 +198,30 @@ async def register(request: Request) -> JSONResponse:
         "token": token,
         "mcp_url": f"{base}/{token}/mcp",
     })
+
+
+async def admin_add_tokens(request: Request) -> JSONResponse:
+    if _valid_tokens is None:
+        return JSONResponse({"error": "Not in private mode"}, status_code=404)
+    auth = request.headers.get("authorization", "")
+    if not _ADMIN_SECRET or auth != f"Bearer {_ADMIN_SECRET}":
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    body = await request.json()
+    new_tokens = body.get("tokens", [])
+    if not isinstance(new_tokens, list):
+        return JSONResponse({"error": "tokens must be a list"}, status_code=400)
+    added = []
+    for t in new_tokens:
+        t = str(t).strip()
+        if t and t not in _valid_tokens:
+            _valid_tokens.add(t)
+            added.append(t)
+    if added and _TOKENS_FILE:
+        with open(_TOKENS_FILE, "a") as f:
+            for t in added:
+                f.write(t + "\n")
+    log.info(f"Admin: added {len(added)} tokens ({len(_valid_tokens)} total)")
+    return JSONResponse({"added": len(added), "total": len(_valid_tokens)})
 
 
 # ---------------------------------------------------------------------------
@@ -222,12 +295,17 @@ async def oauth_protected_resource(request: Request) -> JSONResponse:
 
 
 async def oauth_protected_resource_token(request: Request) -> JSONResponse:
-    """Per-token resource metadata — resource identifies the specific MCP URL."""
+    """Per-token resource metadata — resource identifies the specific MCP URL.
+
+    Points authorization_servers at the per-token issuer ({base}/{token}) so
+    clients follow RFC 8414 path-based discovery to /{token}/authorize instead
+    of falling back to the root /authorize (which doesn't know the token).
+    """
     base = _relay_base(request)
     token = request.path_params["token"]
     return JSONResponse({
         "resource": f"{base}/{token}/mcp",
-        "authorization_servers": [base],
+        "authorization_servers": [f"{base}/{token}"],
         "bearer_methods_supported": ["header"],
     })
 
@@ -261,7 +339,7 @@ _APPROVE_PAGE = """\
   <p>Claude Desktop wants to access your personal BrainWiz memory.<br>
      Approving lets it capture, search, and browse your stored thoughts.</p>
   <div class="token">{token_display}</div>
-  <form method="POST" action="/authorize">
+  <form method="POST" action="{form_action}">
     <input type="hidden" name="token" value="{token}">
     <input type="hidden" name="redirect_uri" value="{redirect_uri}">
     <input type="hidden" name="code_challenge" value="{code_challenge}">
@@ -310,6 +388,33 @@ async def client_registration(request: Request) -> JSONResponse:
 
     redirect_uris = body.get("redirect_uris", [])
     client_id = secrets.token_urlsafe(16)
+    return JSONResponse({
+        "client_id": client_id,
+        "client_id_issued_at": int(time.time()),
+        "grant_types": body.get("grant_types", ["authorization_code"]),
+        "response_types": body.get("response_types", ["code"]),
+        "token_endpoint_auth_method": body.get("token_endpoint_auth_method", "none"),
+        "redirect_uris": redirect_uris,
+        "client_name": body.get("client_name", ""),
+        "scope": body.get("scope", ""),
+    }, status_code=201)
+
+
+async def client_registration_token(request: Request) -> JSONResponse:
+    """Per-token client registration — returns a client_id that encodes the token.
+
+    Because this endpoint URL differs from the root /register/client, clients
+    that properly use per-token discovery will register here fresh and receive
+    a token-encoded client_id. The authorize endpoint decodes the token from it.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    token = request.path_params["token"]
+    log.info(f"Per-token client registration for tunnel: {token[:8]}...")
+    redirect_uris = body.get("redirect_uris", [])
+    client_id = f"bwz.{token}"
     return JSONResponse({
         "client_id": client_id,
         "client_id_issued_at": int(time.time()),
@@ -375,6 +480,7 @@ async def authorize_get(request: Request) -> HTMLResponse:
             redirect_uri=redirect_uri,
             code_challenge=code_challenge,
             state=state,
+            form_action="/authorize",
         )
     )
 
@@ -451,10 +557,138 @@ async def token_exchange(request: Request) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
+# Per-token OAuth endpoints (for clients that do path-based discovery)
+# ---------------------------------------------------------------------------
+
+async def oauth_server_metadata_token(request: Request) -> JSONResponse:
+    """Per-token OAuth authorization server metadata.
+
+    Points authorization_endpoint at /{token}/authorize so clients that do
+    path-based discovery (RFC 8414 §3) learn the token without needing a
+    resource parameter in the /authorize request.
+
+    Handles multiple discovery URL patterns that different clients try:
+      /.well-known/oauth-authorization-server/{token}
+      /.well-known/oauth-authorization-server/{token}/mcp   (Codex appends full path)
+      /{token}/mcp/.well-known/oauth-authorization-server   (Codex also tries this)
+      /{token}/.well-known/oauth-authorization-server
+    """
+    base = _relay_base(request)
+    # Compute the issuer as the URL with the .well-known segment removed.
+    # RFC 8414 requires the returned issuer to exactly match the issuer URL
+    # that was used to construct the discovery URL — clients validate this.
+    #
+    # Patterns handled:
+    #   /.well-known/oauth-authorization-server/{token}/mcp  → issuer = {base}/{token}/mcp
+    #   /{token}/mcp/.well-known/oauth-authorization-server  → issuer = {base}/{token}/mcp
+    #   /{token}/.well-known/oauth-authorization-server      → issuer = {base}/{token}
+    path = request.url.path
+    wk = "/.well-known/oauth-authorization-server"
+    if path.startswith(wk):
+        issuer_path = path[len(wk):]          # e.g. "/{token}/mcp"
+    elif wk in path:
+        issuer_path = path[:path.index(wk)]   # e.g. "/{token}/mcp"
+    else:
+        issuer_path = ""
+    issuer_path = issuer_path.rstrip("/")
+    issuer = f"{base}{issuer_path}" if issuer_path else base
+
+    # Extract the tunnel token (first path component of issuer_path)
+    token = next((p for p in issuer_path.split("/") if p), "")
+    return JSONResponse({
+        "issuer": issuer,
+        # Use the token-specific authorize endpoint so Codex (which caches by
+        # authorization_endpoint) treats this as a new server and re-registers
+        # via /register/client/{token}, giving it a token-encoded client_id.
+        "authorization_endpoint": f"{base}/{token}/authorize",
+        "token_endpoint": f"{base}/token",
+        "registration_endpoint": f"{base}/register/client/{token}",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["none"],
+    })
+
+
+async def authorize_token_get(request: Request) -> HTMLResponse:
+    """Show OAuth approval page — token is already known from the URL path."""
+    token = request.path_params["token"]
+    params = dict(request.query_params)
+    redirect_uri   = params.get("redirect_uri", "")
+    code_challenge = params.get("code_challenge", "")
+    state          = params.get("state", "")
+
+    if token not in tunnels:
+        return HTMLResponse(
+            _ERROR_PAGE.format(
+                title="Unknown Instance",
+                message="This BrainWiz token is not registered with the relay. "
+                        "Start the BrainWiz app and try again.",
+            ),
+            status_code=404,
+        )
+
+    tunnel = tunnels[token]
+    if not tunnel.ws:
+        return HTMLResponse(
+            _ERROR_PAGE.format(
+                title="BrainWiz is Offline",
+                message="Your BrainWiz app is not currently connected to the relay. "
+                        "Make sure the app is running, then try again.",
+            ),
+            status_code=503,
+        )
+
+    token_display = token[:8] + "…"
+    return HTMLResponse(
+        _APPROVE_PAGE.format(
+            token=token,
+            token_display=token_display,
+            redirect_uri=redirect_uri,
+            code_challenge=code_challenge,
+            state=state,
+            form_action=f"/{token}/authorize",
+        )
+    )
+
+
+async def authorize_token_post(request: Request) -> RedirectResponse:
+    """Process approval for per-token authorize endpoint."""
+    _purge_expired_codes()
+    token = request.path_params["token"]
+    form = await request.form()
+    redirect_uri   = str(form.get("redirect_uri", ""))
+    code_challenge = str(form.get("code_challenge", ""))
+    state          = str(form.get("state", ""))
+
+    if not token or token not in tunnels:
+        return HTMLResponse(
+            _ERROR_PAGE.format(
+                title="Invalid Token",
+                message="The BrainWiz token is no longer valid. Please try again.",
+            ),
+            status_code=400,
+        )
+
+    code = secrets.token_urlsafe(16)
+    auth_codes[code] = {
+        "token": token,
+        "code_challenge": code_challenge,
+        "redirect_uri": redirect_uri,
+        "expires_at": time.time() + AUTH_CODE_TTL,
+    }
+    log.info(f"Auth code issued for tunnel (token path): {token[:8]}...")
+
+    sep = "&" if "?" in redirect_uri else "?"
+    location = f"{redirect_uri}{sep}code={code}&state={state}"
+    return RedirectResponse(location, status_code=302)
+
+
+# ---------------------------------------------------------------------------
 # Regular HTTP proxy
 # ---------------------------------------------------------------------------
 
-async def proxy_request(request: Request) -> PlainTextResponse | JSONResponse:
+async def proxy_request(request: Request) -> Response | JSONResponse:
     token = request.path_params["token"]
 
     if not _check_bearer(request, token):
@@ -501,10 +735,13 @@ async def proxy_request(request: Request) -> PlainTextResponse | JSONResponse:
     finally:
         tunnel.pending.pop(req_id, None)
 
-    return PlainTextResponse(
+    backend_headers = response_msg.get("headers", {})
+    content_type = backend_headers.get("content-type", "text/plain")
+    return Response(
         content=response_msg.get("body", ""),
         status_code=response_msg.get("status", 200),
-        headers=response_msg.get("headers", {}),
+        media_type=content_type,
+        headers={k: v for k, v in backend_headers.items() if k.lower() != "content-type"},
     )
 
 
@@ -597,19 +834,29 @@ async def health(request: Request) -> JSONResponse:
 routes = [
     Route("/health", health, methods=["GET"]),
     Route("/register", register, methods=["POST"]),
+    Route("/admin/tokens", admin_add_tokens, methods=["POST"]),
     # OAuth 2.1 discovery + flow (must come before /{token}/... catch-alls)
     Route("/.well-known/oauth-authorization-server", oauth_server_metadata, methods=["GET"]),
+    # RFC 8414 path-based discovery: Codex appends the full MCP path (e.g. /{token}/mcp)
+    Route("/.well-known/oauth-authorization-server/{path:path}", oauth_server_metadata_token, methods=["GET"]),
     Route("/.well-known/oauth-protected-resource", oauth_protected_resource, methods=["GET"]),
     Route("/authorize", authorize_get, methods=["GET"]),
     Route("/authorize", authorize_post, methods=["POST"]),
     Route("/token", token_exchange, methods=["POST"]),
     Route("/register/client", client_registration, methods=["POST"]),
+    Route("/register/client/{token}", client_registration_token, methods=["POST"]),
     # Tunnel WebSocket
     WebSocketRoute("/tunnel/{token}", tunnel_endpoint),
-    # Per-token OAuth protected resource metadata (must be before catch-all)
+    # Per-token OAuth metadata (must be before catch-all)
+    Route("/{token}/.well-known/oauth-authorization-server", oauth_server_metadata_token, methods=["GET"]),
+    Route("/{token}/mcp/.well-known/oauth-authorization-server", oauth_server_metadata_token, methods=["GET"]),
     Route("/{token}/.well-known/oauth-protected-resource", oauth_protected_resource_token, methods=["GET"]),
+    # Per-token authorize endpoints (for clients that do path-based discovery)
+    Route("/{token}/authorize", authorize_token_get, methods=["GET"]),
+    Route("/{token}/authorize", authorize_token_post, methods=["POST"]),
     # MCP proxy routes
     Route("/{token}/mcp", proxy_sse, methods=["GET"]),
+    Route("/{token}/mcp", proxy_request, methods=["POST", "DELETE"]),
     Route("/{token}/{path:path}", proxy_request, methods=["GET", "POST", "PUT", "DELETE"]),
 ]
 
