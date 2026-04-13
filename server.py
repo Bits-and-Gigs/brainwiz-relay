@@ -6,6 +6,7 @@ the relay forwards traffic to user apps over persistent WebSocket tunnels.
 
 Routes:
   POST /register                              — App registers, gets a token
+  POST /license/activate                      — Docker one-time license activation
   POST /admin/tokens                          — Add tokens to whitelist (private mode only)
   DELETE /admin/tokens                        — Remove tokens from whitelist (private mode only)
   GET  /admin/stats                           — Per-token request stats (private mode only)
@@ -37,6 +38,7 @@ import secrets
 import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Union
 from urllib.parse import parse_qs, urlparse
 
@@ -52,6 +54,36 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("relay")
 
 AUTH_CODE_TTL = 300       # 5 minutes
+
+# ---------------------------------------------------------------------------
+# License signing (Docker activation)
+# ---------------------------------------------------------------------------
+# SIGNING_KEY env var: base64-encoded PKCS8 PEM private key (Ed25519).
+# Generate with: python -c "
+#   from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+#   from cryptography.hazmat.primitives.serialization import Encoding, PrivateFormat, NoEncryption
+#   import base64
+#   k = Ed25519PrivateKey.generate()
+#   print(base64.b64encode(k.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption())).decode())
+# "
+# Set via: flyctl secrets set SIGNING_KEY=<value>
+
+_SIGNING_KEY_B64 = os.getenv("SIGNING_KEY", "")
+_signing_key = None
+
+if _SIGNING_KEY_B64:
+    try:
+        from cryptography.hazmat.primitives.serialization import load_pem_private_key
+        _pem = base64.b64decode(_SIGNING_KEY_B64)
+        _signing_key = load_pem_private_key(_pem, password=None)
+        log.info("License signing key loaded.")
+    except Exception as e:
+        log.error(f"Failed to load SIGNING_KEY: {e}")
+else:
+    log.warning("SIGNING_KEY not set — /license/activate will return 503.")
+
+# license_key → instance_id (in-memory; survives only until relay restart)
+_docker_activations: dict[str, str] = {}
 
 # Pending slots are either a Future (regular request) or Queue (SSE stream)
 Pending = Union[asyncio.Future, asyncio.Queue]
@@ -239,6 +271,43 @@ async def register(request: Request) -> JSONResponse:
     return JSONResponse({
         "token": token,
         "mcp_url": f"{base}/{token}/mcp",
+    })
+
+
+async def license_activate(request: Request) -> JSONResponse:
+    """One-time Docker license activation. Returns a signed activation token."""
+    if not _signing_key:
+        return JSONResponse({"error": "License signing not configured on this relay."}, status_code=503)
+
+    body = await request.json()
+    license_key = (body.get("license_key") or "").strip()
+    instance_id = (body.get("instance_id") or "").strip()
+
+    if not license_key or not instance_id:
+        return JSONResponse({"error": "license_key and instance_id are required"}, status_code=400)
+
+    # Validate key against whitelist (private mode)
+    if _valid_tokens is not None and license_key not in _valid_tokens:
+        return JSONResponse({"error": "Invalid license key"}, status_code=403)
+
+    # Reject if already claimed by a different instance
+    existing = _docker_activations.get(license_key)
+    if existing and existing != instance_id:
+        log.warning(f"Docker activation conflict: {license_key[:8]}... already claimed by {existing[:8]}...")
+        return JSONResponse({"error": "License key already activated on another instance."}, status_code=403)
+
+    _docker_activations[license_key] = instance_id
+
+    activated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    payload = f"{license_key}:{instance_id}:{activated_at}".encode()
+    signature = base64.b64encode(_signing_key.sign(payload)).decode()
+
+    log.info(f"Docker license activated: key={license_key[:8]}... instance={instance_id[:8]}...")
+    return JSONResponse({
+        "license_key": license_key,
+        "instance_id": instance_id,
+        "activated_at": activated_at,
+        "signature": signature,
     })
 
 
@@ -954,6 +1023,7 @@ async def health(request: Request) -> JSONResponse:
 routes = [
     Route("/health", health, methods=["GET"]),
     Route("/register", register, methods=["POST"]),
+    Route("/license/activate", license_activate, methods=["POST"]),
     Route("/admin/tokens", admin_add_tokens, methods=["POST"]),
     Route("/admin/tokens", admin_remove_tokens, methods=["DELETE"]),
     Route("/admin/stats", admin_stats, methods=["GET"]),
