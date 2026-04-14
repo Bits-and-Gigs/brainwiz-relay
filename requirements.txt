@@ -2,4 +2,3 @@ starlette==0.45.3
 uvicorn[standard]==0.34.0
 websockets==14.2
 python-multipart>=0.0.18
-cryptography>=42.0
