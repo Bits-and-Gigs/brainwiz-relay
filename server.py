@@ -6,7 +6,8 @@ the relay forwards traffic to user apps over persistent WebSocket tunnels.
 
 Routes:
   POST /register                              — App registers, gets a token
-  POST /license/activate                      — Docker one-time license activation
+  POST /license/activate                      — Docker startup registration (kicks previous instance)
+  POST /license/heartbeat                     — Docker daily liveness check
   POST /admin/tokens                          — Add tokens to whitelist (private mode only)
   DELETE /admin/tokens                        — Remove tokens from whitelist (private mode only)
   GET  /admin/stats                           — Per-token request stats (private mode only)
@@ -38,7 +39,6 @@ import secrets
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from typing import Union
 from urllib.parse import parse_qs, urlparse
 
@@ -56,33 +56,9 @@ log = logging.getLogger("relay")
 AUTH_CODE_TTL = 300       # 5 minutes
 
 # ---------------------------------------------------------------------------
-# License signing (Docker activation)
+# Docker license tracking (in-memory; clears on relay restart)
 # ---------------------------------------------------------------------------
-# SIGNING_KEY env var: base64-encoded PKCS8 PEM private key (Ed25519).
-# Generate with: python -c "
-#   from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-#   from cryptography.hazmat.primitives.serialization import Encoding, PrivateFormat, NoEncryption
-#   import base64
-#   k = Ed25519PrivateKey.generate()
-#   print(base64.b64encode(k.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption())).decode())
-# "
-# Set via: flyctl secrets set SIGNING_KEY=<value>
-
-_SIGNING_KEY_B64 = os.getenv("SIGNING_KEY", "")
-_signing_key = None
-
-if _SIGNING_KEY_B64:
-    try:
-        from cryptography.hazmat.primitives.serialization import load_pem_private_key
-        _pem = base64.b64decode(_SIGNING_KEY_B64)
-        _signing_key = load_pem_private_key(_pem, password=None)
-        log.info("License signing key loaded.")
-    except Exception as e:
-        log.error(f"Failed to load SIGNING_KEY: {e}")
-else:
-    log.warning("SIGNING_KEY not set — /license/activate will return 503.")
-
-# license_key → instance_id (in-memory; survives only until relay restart)
+# license_key → instance_id of the currently active deployment
 _docker_activations: dict[str, str] = {}
 
 # Pending slots are either a Future (regular request) or Queue (SSE stream)
@@ -275,10 +251,11 @@ async def register(request: Request) -> JSONResponse:
 
 
 async def license_activate(request: Request) -> JSONResponse:
-    """One-time Docker license activation. Returns a signed activation token."""
-    if not _signing_key:
-        return JSONResponse({"error": "License signing not configured on this relay."}, status_code=503)
-
+    """
+    Called by a Docker container on every startup. Registers the instance as
+    the active deployment for this license key, displacing any previous one.
+    The displaced instance will be rejected on its next heartbeat.
+    """
     body = await request.json()
     license_key = (body.get("license_key") or "").strip()
     instance_id = (body.get("instance_id") or "").strip()
@@ -286,29 +263,50 @@ async def license_activate(request: Request) -> JSONResponse:
     if not license_key or not instance_id:
         return JSONResponse({"error": "license_key and instance_id are required"}, status_code=400)
 
-    # Validate key against whitelist (private mode)
     if _valid_tokens is not None and license_key not in _valid_tokens:
         return JSONResponse({"error": "Invalid license key"}, status_code=403)
 
-    # Reject if already claimed by a different instance
-    existing = _docker_activations.get(license_key)
-    if existing and existing != instance_id:
-        log.warning(f"Docker activation conflict: {license_key[:8]}... already claimed by {existing[:8]}...")
-        return JSONResponse({"error": "License key already activated on another instance."}, status_code=403)
-
+    previous = _docker_activations.get(license_key)
     _docker_activations[license_key] = instance_id
 
-    activated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    payload = f"{license_key}:{instance_id}:{activated_at}".encode()
-    signature = base64.b64encode(_signing_key.sign(payload)).decode()
+    if previous and previous != instance_id:
+        log.info(f"Docker license re-registered (kicked {previous[:8]}...): key={license_key[:8]}... instance={instance_id[:8]}...")
+    else:
+        log.info(f"Docker license registered: key={license_key[:8]}... instance={instance_id[:8]}...")
 
-    log.info(f"Docker license activated: key={license_key[:8]}... instance={instance_id[:8]}...")
-    return JSONResponse({
-        "license_key": license_key,
-        "instance_id": instance_id,
-        "activated_at": activated_at,
-        "signature": signature,
-    })
+    return JSONResponse({"ok": True})
+
+
+async def license_heartbeat(request: Request) -> JSONResponse:
+    """
+    Called daily by a running Docker container. Confirms this is still the
+    active instance. Returns 403 with reason='kicked' if another deployment
+    has since registered the same key.
+    """
+    body = await request.json()
+    license_key = (body.get("license_key") or "").strip()
+    instance_id = (body.get("instance_id") or "").strip()
+
+    if not license_key or not instance_id:
+        return JSONResponse({"error": "license_key and instance_id are required"}, status_code=400)
+
+    if _valid_tokens is not None and license_key not in _valid_tokens:
+        return JSONResponse({"valid": False, "reason": "invalid_key"}, status_code=403)
+
+    active = _docker_activations.get(license_key)
+
+    # Relay restarted and lost state — accept and re-register this instance.
+    if active is None:
+        _docker_activations[license_key] = instance_id
+        log.info(f"Docker heartbeat re-registered after relay restart: key={license_key[:8]}... instance={instance_id[:8]}...")
+        return JSONResponse({"valid": True})
+
+    if active != instance_id:
+        log.info(f"Docker heartbeat kicked: key={license_key[:8]}... instance={instance_id[:8]}...")
+        return JSONResponse({"valid": False, "reason": "kicked"}, status_code=403)
+
+    log.debug(f"Docker heartbeat OK: key={license_key[:8]}... instance={instance_id[:8]}...")
+    return JSONResponse({"valid": True})
 
 
 async def admin_add_tokens(request: Request) -> JSONResponse:
@@ -1024,6 +1022,7 @@ routes = [
     Route("/health", health, methods=["GET"]),
     Route("/register", register, methods=["POST"]),
     Route("/license/activate", license_activate, methods=["POST"]),
+    Route("/license/heartbeat", license_heartbeat, methods=["POST"]),
     Route("/admin/tokens", admin_add_tokens, methods=["POST"]),
     Route("/admin/tokens", admin_remove_tokens, methods=["DELETE"]),
     Route("/admin/stats", admin_stats, methods=["GET"]),
