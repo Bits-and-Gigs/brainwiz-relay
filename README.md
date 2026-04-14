@@ -4,16 +4,17 @@ A lightweight WebSocket tunnel relay that lets AI clients reach MCP servers runn
 
 ## Privacy
 
-**Your memories never leave your machine.** All BrainWiz data (memories, the database, the embedding model) is stored locally on your computer or self-hosted server. The relay never stores, logs, or has persistent access to memory content.
+All BrainWiz data (memories, the database, the embedding model) is stored locally on your computer or self-hosted server and is never persisted by the relay.
 
-What the relay does handle:
+**Desktop/relay mode:** MCP requests from AI clients travel to the relay over HTTPS and are forwarded to your local app over an encrypted WebSocket tunnel (WSS). The relay terminates TLS, so request content is visible to it in transit — it is not end-to-end encrypted. However, the relay never logs or stores memory content. Only aggregate request counts and payload sizes are tracked per license key for abuse detection.
 
-- **Desktop/relay mode:** MCP requests from AI clients are proxied through this server to reach your local app. Request content passes through in transit but is never logged or stored. Only aggregate request counts and payload sizes are tracked per license key for abuse detection.
-- **Docker/self-hosted mode:** Nothing passes through the relay except a license registration call at startup and a daily heartbeat (license key + instance ID only). All MCP traffic goes directly between AI clients and your server.
+**Docker/self-hosted mode:** Nothing passes through the relay except a license registration call at startup and a daily heartbeat (license key + instance ID only). All MCP traffic goes directly between AI clients and your server — the relay never sees your memory content.
 
 In both modes, the relay holds only an in-memory map of active connections that is cleared on every restart.
 
 Your email address is stored by our payment processor (not this server) in association with your license key. It may be used to contact you if abuse is detected.
+
+> **Note:** This privacy policy applies only to the official relay at `https://relay.brainwiz.app`. Custom or self-hosted relays may behave differently. If you are using a custom relay URL, make sure you trust the operator of that server.
 
 ## Routes
 
